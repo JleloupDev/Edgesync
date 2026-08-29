@@ -15,9 +15,9 @@ import {
 } from '../core/envelope'
 import { Keyring, keyCommitment } from '../core/keyring'
 import {
-  AclChain, arbiterSet, resolveAccess, hasRemoval, signEpoch, epochId, type Epoch,
+  AclChain, arbiterSet, resolveAccess, hasRemoval, signEpoch, epochId, applyOp, type Epoch,
 } from '../core/acl-chain'
-import { Access, signAclOp, type AclChange, type AclOp } from '../core/acl-ops'
+import { Access, signAclOp, verifyAclOp, type AclChange, type AclOp } from '../core/acl-ops'
 import type { ICrdt } from '../ports/crdt'
 import type { ITransport } from '../ports/transport'
 import { PeerStore, PinnedKeyChangedError } from '../ports/peer-store'
@@ -164,7 +164,30 @@ export class Session {
    * without changing this shape.
    */
   mint(ops: AclOp[]): boolean {
-    if (!this.isVaultRoot || !this.isArbiter() || ops.length === 0) return false
+    if (!this.isVaultRoot || !this.isArbiter()) return false
+
+    // D39 — the arbiter checks the INITIATOR's signature before embedding an op,
+    // exactly as every other peer will on receipt. Skipping it corrupts only the
+    // arbiter: peers reject the epoch at validateEpoch, but the arbiter has
+    // already folded the forged op into its own state and goes on minting from
+    // there. Ordering is the arbiter's job; vouching for content is not.
+    ops = ops.filter((op) => verifyAclOp(this.chain.vaultId, op))
+
+    // …and only commits ops that would actually APPLY. Without this dry run, a
+    // correctly-signed but unauthorised op still produced an epoch — one with no
+    // effect on the state, but a real link in the chain. Which means ANY peer,
+    // member or not, could force one epoch per request: unbounded amplification
+    // from an attacker who holds nothing but a keypair.
+    let probe = this.chain.state()
+    const effective: AclOp[] = []
+    for (const op of ops) {
+      const next = applyOp(probe, op)
+      if (!next) continue
+      probe = next
+      effective.push(op)
+    }
+    if (effective.length === 0) return false
+    ops = effective
 
     const height = this.chain.height() + 1
     const round = 0

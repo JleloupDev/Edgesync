@@ -450,8 +450,16 @@ export class AclChain {
     this.push(e)
   }
 
-  /** Adopt an epoch built locally by the arbiter itself (already signed by it). */
+  /**
+   * Adopt an epoch built locally — by the arbiter that just signed it, or the
+   * genesis. The certificate cannot be checked here (we ARE the signer), but the
+   * ops still can, and must: an op whose initiator signature does not verify has
+   * no business entering anyone's state, least of all the arbiter's.
+   */
   appendLocal(e: Epoch): void {
+    for (const op of e.ops) {
+      if (!verifyAclOp(this.vaultId, op)) throw new Error('epoch rejected: op signature')
+    }
     this.push(e)
   }
 
