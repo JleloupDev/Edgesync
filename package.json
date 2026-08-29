@@ -1,0 +1,44 @@
+{
+  "name": "edgesync-protocol",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Protocole de collaboration P2P chiffre de bout en bout et signe : ACL en chaine d'epoques, agnostique au transport et au CRDT.",
+  "license": "AGPL-3.0-or-later",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./node": {
+      "source": "./src/node.ts",
+      "default": "./src/node.ts"
+    }
+  },
+  "files": [
+    "src",
+    "docs",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "peer": "tsx test/peer-process.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.2.0",
+    "@noble/curves": "^1.8.0",
+    "@noble/hashes": "^1.7.0",
+    "yjs": "^13.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "ws": "^8.18.0"
+  }
+}

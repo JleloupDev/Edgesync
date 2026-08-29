@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.env
+
+# Sorties de test locales
+test-results/
+coverage/
