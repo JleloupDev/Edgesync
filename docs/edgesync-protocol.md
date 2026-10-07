@@ -161,10 +161,16 @@ Message encadré = `[type:1][payload]`.
 | Type | Payload | Rôle |
 |---|---|---|
 | `HELLO` | `{ signPub, boxPub, nonce, sig(nonce) }` | handshake : prouve l'identité, épingle en TOFU (PeerStore) |
-| `OP` | une **enveloppe** (cf. §D) | un update CRDT chiffré + signé |
+| `OP` | une **enveloppe** (cf. §D) | une transaction **en direct** : ce que le signataire vient d'écrire, rien de relayé |
 | `KEY` | `{ resource, epoch, sealed }` | livraison de clé wrappée (grant + rotation) |
 | `SYNC_REQ` | `{ stateVector }` | *(si Q4 = complet)* demande de catch-up |
 | `SYNC_RESP` | `{ ops[] \| snapshot }` | *(si Q4 = complet)* réponse de catch-up |
+| `STATE_PUSH` | une **enveloppe** | état complet re-poussé après réception d'une clé (rattrapage) |
+
+> `OP` d'un côté, `SYNC_RESP` et `STATE_PUSH` de l'autre : la réception est la
+> même, mais seul `OP` dit « le signataire a écrit ceci ». Le rattrapage porte les
+> écritures de tous sous la signature de celui qui répond. Le canal de logs (§K)
+> repose sur cette distinction.
 
 > **DÉCISION OUVERTE — Q4, périmètre des messages.**
 > *Proposé* : commencer **minimal** (`HELLO` + `OP` + `KEY`). *Alternative* :
@@ -237,3 +243,134 @@ PeerStore TOFU. **Ouvertes** : Q1 (modèle de clés), Q4 (périmètre des messag
 ADR-0001 collab = protocole P2P · ADR-0002 serveur hors protocole · ADR-0003
 identité à 2 paires · ADR-0004 format d'enveloppe · ADR-0005 encrypt-à-l'envoi &
 révocation forward-only · ADR-0006 ports ICrdt/ITransport.
+
+## K. Attribution du contenu : le canal de logs
+
+**Statut** : conception, non implémentée. Seul le prérequis existe : `OP` est
+réservé aux transactions en direct (§E). Répond à `Q3` de la
+[spécification ACL](edgesync-acl-arbitrage-spec.md).
+
+### Le problème
+
+La signature d'enveloppe prouve **qui a envoyé**, pas **qui a écrit**. Les deux
+diffèrent dans deux cas :
+
+- **le rattrapage** : celui qui répond fusionne les écritures de tous et signe le
+  lot avec sa propre clé ;
+- **l'identité Yjs** : chaque élément porte un numéro d'auteur (`clientID`) tiré au
+  hasard, lié à aucune clé. Un membre qui écrit peut utiliser le numéro d'un autre.
+
+Il ne gagne aucun droit, mais l'interface affiche le mauvais auteur. L'attribution
+est donc indicative, pas prouvée.
+
+### Le principe
+
+Un **canal à part**, qui ne fait que décrire le contenu.
+
+- **Optionnel** : on s'y abonne ou non. Le contenu fonctionne pareil sans lui.
+- **Construit sur le mécanisme de canal existant** : une `Session` sur sa propre
+  ressource, avec sa clé, ses droits et son rattrapage. Seul le contenu change : un
+  nouvel adaptateur `ICrdt`, à côté de Yjs. Le cœur ne bouge pas.
+- **Un ensemble non ordonné, en ajout seul** : des notes signées, jamais modifiées
+  ni retirées. Fusionner = faire l'union. Pas d'arbitre, pas de consensus.
+- **Pas sur un document Yjs** : dans Yjs, tout membre qui écrit peut supprimer des
+  éléments, donc effacer les notes des autres.
+- **Indépendant du CRDT** : tous identifient leurs opérations par (auteur,
+  compteur). Le canal désigne des plages d'identifiants, pas un format Yjs.
+
+L'historique devient une propriété du réseau, découplée du contenu : le contenu se
+compacte librement, et l'historique suit sa propre politique de conservation.
+
+### La transaction et son identifiant
+
+Dans Yjs, chaque élément a un identifiant stable : `(clientID, compteur)`. Une
+transaction est une plage contiguë pour un même `clientID` : `(123456, [0, 40))`.
+Yjs la lit dans une mise à jour sans l'appliquer (`parseUpdateMeta`). Cette plage
+ne change jamais, même après fusion ou compaction.
+
+Une transaction reçue en `OP` ne contient que les éléments de son signataire : Yjs
+n'émet en local que les modifications locales. Le lien `clientID → clé` vient donc
+de **l'observation** de l'enveloppe signée, sans enregistrement préalable.
+
+### Les notes de témoin
+
+Un pair abonné, **témoin**, note les transactions qu'il reçoit **en `OP`**.
+
+| Champ | Contenu |
+|---|---|
+| témoin | sa clé publique |
+| émetteur | `signerPub` de l'enveloppe reçue |
+| numéro Yjs | le `clientID` de la transaction |
+| plage | `[début, fin)` des compteurs |
+| position | l'`epochId` de l'enveloppe |
+| signature | celle du témoin, sur tous les champs ci-dessus |
+
+Pas d'empreinte du contenu : la question du témoin est « qui l'a envoyé », et un
+identifiant Yjs désigne toujours le même contenu.
+
+Une note est identifiée par `(témoin, numéro Yjs, plage)`. Deux notes identiques
+n'en font qu'une.
+
+### La règle de publication
+
+À la réception d'une transaction en `OP` :
+
+1. **J'ai déjà reçu la note de cette transaction**, et elle dit le même émetteur :
+   je ne publie rien. Le silence vaut accord.
+2. **J'ai reçu la note, avec un autre émetteur** : je signale une incohérence.
+3. **Je n'ai pas reçu de note** : je publie la mienne.
+
+Si la note arrive avant la transaction, je la garde en attente. Si la transaction
+n'arrive que par rattrapage, je ne suis pas témoin et je ne dis rien.
+
+Il n'y a donc de doublons que pendant la propagation (gossip) : deux témoins qui
+publient en même temps.
+
+**Jamais noté** : `SYNC_RESP` et `STATE_PUSH`. Ils portent les écritures de tous
+sous la signature de celui qui répond. Les noter créerait de fausses incohérences.
+
+```plantuml
+@startuml log-channel
+title Canal de logs : une note par transaction, le désaccord se voit
+participant "Alice" as A
+participant "Témoin B" as B
+participant "Témoin C" as C
+participant "Bob (malveillant)" as M
+A -> B : OP (123456, [0,40)) signé Alice
+A -> C : OP (123456, [0,40)) signé Alice
+B -> C : note : (123456, [0,40)) émis par Alice
+note over C : même émetteur → ne publie rien
+M -> C : OP (123456, [40,50)) signé Bob
+note over C : aucune note reçue → publie\n« (123456, [40,50)) émis par Bob »
+note over A, C : Alice ne revendiquera jamais [40,50) :\nle numéro 123456 a deux émetteurs, la contradiction est signée
+@enduml
+```
+
+### Ce que ça garantit
+
+- **Usurper l'auteur, c'est falsifier une opération signée.** Le canal ne fait
+  qu'écouter. Pour qu'une note dise « émis par Alice », il faut une enveloppe
+  signée par Alice.
+- **Le mensonge est signé.** Un témoin qui ment s'engage avec sa clé ; les autres
+  témoins le contredisent.
+- **Limites.** Sans témoin abonné au moment de l'écriture, rien n'est noté. Un
+  témoin peut se taire. On ne distingue pas un retard d'une omission.
+
+### Les rollbacks
+
+On ne gomme jamais, on contre-passe. Un rollback de contenu est fait de
+changements compensatoires ([ADR-0005](adr/0005-encrypt-a-lenvoi-revocation-forward-only.md),
+D15). Ces changements sont des transactions comme les autres, donc notées comme les
+autres.
+
+### Évolutions prévues
+
+- **Signature d'auteur (option A)** : l'auteur publie ses propres transactions
+  signées. La preuve ne dépend plus des témoins. Activable par vault.
+- **Choix des témoins** : par défaut, le pair privilégié et les arbitres ; d'autres
+  selon la configuration du vault.
+- **Regroupement des plages** contiguës par témoin, avec la compaction.
+- **Ancrage par les arbitres** : une empreinte de l'ensemble signée de temps en
+  temps fige le passé.
+- **Fichier de configuration du vault**, transmis à l'arrivée : les canaux à écouter,
+  dont le canal de logs, et leurs politiques de conservation.
