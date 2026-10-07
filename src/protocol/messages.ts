@@ -19,6 +19,7 @@ import { encodeEpoch, decodeEpoch, type Epoch } from '../core/acl-chain'
 
 export enum MsgType {
   Hello = 1,
+  /** A LIVE transaction only: what its signer just wrote, nothing relayed. */
   Op = 2,
   Key = 3,
   SyncReq = 4,
@@ -32,6 +33,10 @@ export enum MsgType {
   /** D14 — "I refuse", never "I did not receive". */
   Reject = 10,
   KeyRequest = 11,
+  /** The whole state, re-pushed after a key arrives. Catch-up, like SyncResp:
+   *  it carries everyone's writes under the pusher's signature, so it must never
+   *  be mistaken for a live Op. */
+  StatePush = 12,
 }
 
 export function frame(type: MsgType, payload: Uint8Array): Uint8Array {

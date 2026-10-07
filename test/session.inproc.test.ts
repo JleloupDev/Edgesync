@@ -9,7 +9,7 @@ import {
   OwnIdentity, YjsCrdt, Bus, InProcessTransport, PeerStore, Session, Keyring,
   AclChain, Access, ROOT_GROUP, keyPrincipal, resolveAccess, randomBytes,
   encrypt, signedRegion, encodeEnvelope, resourceId, concat, encodeHello, encodeKey,
-  frame, MsgType,
+  frame, unframe, decodeEnvelope, MsgType,
 } from '../src/index'
 import { VAULT, VAULT_ID, OWNERS, foundVault, joiner, aclOp } from './vault-fixture'
 
@@ -155,6 +155,34 @@ describe('session — deux plans, un seul vault', () => {
     ])
     await settle()
     expect(resolveAccess(a.chain.state(), complice.signPub)).toBeUndefined()
+  })
+
+  it('Op ne porte que des transactions en direct : l\'etat repousse a la cle part en StatePush', async () => {
+    const { bus, a, b } = await vaultWithTwo()
+    a.crdt.text().insert(0, 'ecrit par A')
+    await settle()
+
+    // Un troisieme membre, puis sa revocation : l'epoque porte une cle neuve, et B,
+    // en la recevant, repousse tout son etat, donc le texte de A, signe par B.
+    const j = joiner()
+    const c = makePeer('C', bus, j.chain, j.keyring)
+    await settle()
+    a.session.requestAclChange(ROOT_GROUP, [
+      { t: 'set', principal: keyPrincipal(c.identity.signPub), access: Access.Write },
+    ])
+    await settle()
+    a.session.requestAclChange(ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(c.identity.signPub) }])
+    await settle()
+    expect(b.text()).toBe('ecrit par A')
+
+    // B n'a jamais rien ecrit : il ne doit jamais avoir emis d'Op. Un Op signe par B
+    // ferait croire, a qui l'observe, que B a ecrit le texte de A.
+    const signedBy = (type: MsgType) => bus.wire
+      .filter((f) => unframe(f).type === type)
+      .map((f) => decodeEnvelope(unframe(f).payload).signerPub)
+      .filter((pub) => containsSub(pub, b.identity.signPub))
+    expect(signedBy(MsgType.Op)).toHaveLength(0)
+    expect(signedBy(MsgType.StatePush).length).toBeGreaterThan(0)
   })
 
   it('un pair rejoint en retard rattrape la chaine puis la cle', async () => {

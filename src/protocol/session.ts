@@ -313,6 +313,7 @@ export class Session {
         case MsgType.Key: return this.onKey(payload)
         case MsgType.SyncReq: return this.onSyncReq(from, payload)
         case MsgType.SyncResp: return this.onOp(from, payload)
+        case MsgType.StatePush: return this.onOp(from, payload)
         case MsgType.AclRequest: return this.onAclRequest(payload)
         case MsgType.EpochPush: return this.onEpochPush(from, payload)
         case MsgType.ChainReq: return this.onChainReq(from, payload)
@@ -396,7 +397,7 @@ export class Session {
     const snapshot = this.sealAt(this.crdt.snapshot())
     if (!snapshot) return
     for (const peer of this.transport.peers()) {
-      this.transport.send(peer, frame(MsgType.Op, snapshot))
+      this.transport.send(peer, frame(MsgType.StatePush, snapshot))
       this.transport.send(peer, frame(MsgType.SyncReq, encodeSyncReq({ resourceId: this.resourceId, stateVector: this.crdt.stateVector() })))
     }
   }

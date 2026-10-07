@@ -43,8 +43,8 @@ design [edgesync-protocol.md](edgesync-protocol.md) et le modèle de confiance
 | **Déclencheur** | grant (au `HELLO` d'un pair, si *granting*) ou `rotate()` |
 | **Payload** | `{ resource, epoch, sealedVaultKey, docWrap }` (JSON/base64) ; `sealedVaultKey = seal(boxPub_dest, K_vault^epoch)` ; `docWrap = Enc(K_vault, K_doc)` |
 | **Chiffrement** | clé scellée vers la clé publique X25519 du destinataire |
-| **Réception** | si `resource` ≠ la mienne → ignore ; `unseal` → `K_vault` ; `keyring.import(epoch, K_vault, docWrap)` (déballe `K_doc`) ; puis **re-pousse** son état (`OP`) sous l'époque courante + redemande un `SYNC_REQ`. |
-| **Réponse** | un `OP` (état re-poussé) + un `SYNC_REQ` |
+| **Réception** | si `resource` ≠ la mienne → ignore ; `unseal` → `K_vault` ; `keyring.import(epoch, K_vault, docWrap)` (déballe `K_doc`) ; puis **re-pousse** son état (`STATE_PUSH`) sous l'époque courante + redemande un `SYNC_REQ`. |
+| **Réponse** | un `STATE_PUSH` (état re-poussé) + un `SYNC_REQ` |
 
 ### `OP` (type 2) — opération de contenu
 
@@ -79,6 +79,23 @@ design [edgesync-protocol.md](edgesync-protocol.md) et le modèle de confiance
 | **Réception** | **identique à `OP`** — y compris le rejet d'époque périmée. (C'est l'absence de cette règle qui ouvrait le contournement de la révocation d'écriture ; cf. [ADR-0005](adr/0005-encrypt-a-lenvoi-revocation-forward-only.md).) |
 | **Réponse** | aucune |
 
+### `STATE_PUSH` (type 12) — état re-poussé après une clé
+
+| | |
+|---|---|
+| **Direction** | pair → tous les pairs |
+| **Déclencheur** | `onKey` |
+| **Payload** | enveloppe ; `ciphertext = Enc(K_doc^courant, snapshot)` |
+| **Chiffrement** | comme `OP` |
+| **Réception** | **identique à `OP`**. |
+| **Réponse** | aucune |
+
+Pourquoi un type à part : l'état complet contient les écritures de **tous** les
+pairs, sous la signature de celui qui le pousse. En `OP`, il ferait croire à un
+observateur que le pousseur a écrit le texte des autres. `OP` est réservé aux
+transactions **en direct** : ce que son signataire vient d'écrire, rien de relayé.
+`SYNC_RESP` et `STATE_PUSH` sont du rattrapage.
+
 ## Séquences d'interaction
 
 **Onboarding** (un pair rejoint) :
@@ -90,7 +107,7 @@ design [edgesync-protocol.md](edgesync-protocol.md) et le modèle de confiance
 
 **Catch-up après coupure** : à la reconnexion, `HELLO` → `SYNC_REQ(state-vector)` → `SYNC_RESP(diff)` chiffré sous l'époque courante.
 
-**Course honnête** (pair en retard sur une rotation) : son `OP` vieux-époque est rejeté par les pairs rotés, puis re-livré sous l'époque courante via le re-push d'`onKey` ; Yjs dédoublonne.
+**Course honnête** (pair en retard sur une rotation) : son `OP` vieux-époque est rejeté par les pairs rotés, puis re-livré sous l'époque courante via le `STATE_PUSH` d'`onKey` ; Yjs dédoublonne.
 
 ## Invariants transverses
 
