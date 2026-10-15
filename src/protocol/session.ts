@@ -20,6 +20,8 @@ import {
 import { Access, signAclOp, verifyAclOp, type AclChange, type AclOp } from '../core/acl-ops'
 import type { ICrdt } from '../ports/crdt'
 import type { ITransport } from '../ports/transport'
+import type { IBroadcast } from '../ports/broadcast'
+import { FloodBroadcast } from '../adapters/flood-broadcast'
 import { PeerStore, PinnedKeyChangedError } from '../ports/peer-store'
 import type { IStorage } from '../ports/storage'
 import { saveAll } from './persistence'
@@ -46,6 +48,9 @@ export interface SessionOpts {
    */
   chain: AclChain
   transport: ITransport
+  /** How live messages reach peers we are not connected to. Defaults to plain
+   *  flooding; inject another strategy without touching the Session. */
+  broadcast?: IBroadcast
   peers: PeerStore
   resource: string
   /** Optional persistence port. The app decides at-rest protection (ADR-0011). */
@@ -68,6 +73,7 @@ export class Session {
   private readonly keyring: Keyring
   private readonly chain: AclChain
   private readonly transport: ITransport
+  private readonly gossip: IBroadcast
   private readonly peers: PeerStore
   private readonly resource: string
   private readonly resourceId: Uint8Array
@@ -93,6 +99,7 @@ export class Session {
     this.keyring = o.keyring
     this.chain = o.chain
     this.transport = o.transport
+    this.gossip = o.broadcast ?? new FloodBroadcast(o.transport)
     this.peers = o.peers
     this.resource = o.resource
     this.resourceId = resourceId(o.resource)
@@ -148,8 +155,9 @@ export class Session {
       (m) => this.id.sign(m),
     )
     // Gossip it regardless: a request has no effect until it is in an epoch, so
-    // circulating it costs nothing and reaches an arbiter we are not adjacent to.
-    this.broadcast(frame(MsgType.AclRequest, encodeAclRequest(op)))
+    // circulating it costs nothing, and every peer that can check it relays it —
+    // which is how it reaches an arbiter we are not adjacent to.
+    this.gossip.spread(frame(MsgType.AclRequest, encodeAclRequest(op)))
     this.mint([op])
   }
 
@@ -211,7 +219,7 @@ export class Session {
     this.chain.appendLocal(epoch)
     if (vaultKey) this.keyring.adopt(id, vaultKey, draft.keyCommit)
 
-    this.broadcast(frame(MsgType.EpochPush, encodeEpochPush(epoch)))
+    this.gossip.spread(frame(MsgType.EpochPush, encodeEpochPush(epoch)))
     // Hand the current key to everyone the NEW state authorises. Unconditional
     // on purpose: an epoch that ADDS someone carries no key material (D11 — no
     // removal), so keying the newcomer cannot be tied to a rotation happening.
@@ -253,10 +261,6 @@ export class Session {
 
   // ── outbound ──────────────────────────────────────────────────────────────
 
-  private broadcast(bytes: Uint8Array): void {
-    for (const peer of this.transport.peers()) this.transport.send(peer, bytes)
-  }
-
   private onPeerUp(peer: string): void {
     this.transport.send(peer, frame(MsgType.Hello, this.hello()))
   }
@@ -273,7 +277,7 @@ export class Session {
 
   private publishOp(update: Uint8Array): void {
     const env = this.sealAt(update)
-    if (env) this.broadcast(frame(MsgType.Op, env))
+    if (env) this.gossip.spread(frame(MsgType.Op, env))
   }
 
   /** Seal under the key in force at the current position (D40). */
@@ -307,15 +311,19 @@ export class Session {
     if (bytes.length < 1 || bytes.length > Session.MAX_MSG) return
     try {
       const { type, payload } = unframe(bytes)
+      // Gossiped types: a copy we already relayed is dropped whole — not applied
+      // twice, not spread again. That single check is what ends the flood.
+      if (GOSSIPED.has(type) && this.gossip.seen(bytes)) return
       switch (type) {
         case MsgType.Hello: return this.onHello(from, payload)
-        case MsgType.Op: return this.onOp(from, payload)
+        case MsgType.Op: return this.onOp(from, payload, bytes)
         case MsgType.Key: return this.onKey(payload)
         case MsgType.SyncReq: return this.onSyncReq(from, payload)
+        // Catch-up is point to point and re-signed by whoever answers: never relayed.
         case MsgType.SyncResp: return this.onOp(from, payload)
         case MsgType.StatePush: return this.onOp(from, payload)
-        case MsgType.AclRequest: return this.onAclRequest(payload)
-        case MsgType.EpochPush: return this.onEpochPush(from, payload)
+        case MsgType.AclRequest: return this.onAclRequest(from, payload, bytes)
+        case MsgType.EpochPush: return this.onEpochPush(from, payload, bytes)
         case MsgType.ChainReq: return this.onChainReq(from, payload)
         case MsgType.ChainResp: return this.onChainResp(from, payload)
         case MsgType.Reject: return this.onReject(from, payload)
@@ -347,7 +355,9 @@ export class Session {
     if (this.isVaultRoot) this.transport.send(from, frame(MsgType.ChainReq, encodeChainReq(this.chain.head())))
   }
 
-  private onOp(from: string, payload: Uint8Array): void {
+  /** `live` is the whole frame when it came as a gossiped Op: once checked, it
+   *  is relayed byte for byte, so it keeps its author's signature hop after hop. */
+  private onOp(from: string, payload: Uint8Array, live?: Uint8Array): void {
     const env = decodeEnvelope(payload)
     if (!eqBytes(env.resourceId, this.resourceId)) return
     if (!verify(env.sig, signedRegion(env.resourceId, env.epochId, env.nonce, env.ciphertext), env.signerPub)) return
@@ -361,6 +371,12 @@ export class Session {
     // peers who learn of a revocation at different moments still converge.
     const acc = resolveAccess(state, env.signerPub)
     if (acc === undefined || acc < Access.Write) return // silent (D14)
+
+    // Signature and right at the position are all a relay needs: it never has to
+    // decrypt, so a `pull` peer — a blind server — relays as well as a reader.
+    // Only checked messages travel, so a flooder cannot make the network work
+    // for it.
+    if (live) this.gossip.spread(live, from)
 
     // No "epoch must be the current one" rule any more: authorisation at the
     // position already cuts a revoked writer off, and dropping it lets a `pull`
@@ -415,15 +431,21 @@ export class Session {
 
   // ── authority plane ───────────────────────────────────────────────────────
 
-  private onAclRequest(payload: Uint8Array): void {
+  private onAclRequest(from: string, payload: Uint8Array, bytes: Uint8Array): void {
     if (!this.isVaultRoot) return
-    // Signature and authorisation of the INITIATOR are checked by the fold and
-    // by validateEpoch (D39) — an arbiter cannot smuggle in an op nobody asked
-    // for, because every peer re-checks it on receipt of the epoch.
-    this.mint([decodeAclRequest(payload)])
+    const op = decodeAclRequest(payload)
+    // Relay only what would apply on our head: correctly signed AND issued by
+    // someone allowed to make that change. A request nobody may grant dies at
+    // the first hop instead of costing every peer a verification.
+    if (!verifyAclOp(this.chain.vaultId, op) || !applyOp(this.chain.state(), op)) return
+    this.gossip.spread(bytes, from)
+    // Signature and authorisation of the INITIATOR are checked again by the fold
+    // and by validateEpoch (D39) — an arbiter cannot smuggle in an op nobody
+    // asked for, because every peer re-checks it on receipt of the epoch.
+    this.mint([op])
   }
 
-  private onEpochPush(from: string, payload: Uint8Array): void {
+  private onEpochPush(from: string, payload: Uint8Array, bytes: Uint8Array): void {
     if (!this.isVaultRoot) return
     const epoch = decodeEpochPush(payload)
     if (this.chain.has(epochId(epoch))) return
@@ -431,10 +453,14 @@ export class Session {
       this.chain.adoptEpoch(epoch)
     } catch {
       // Not applicable on our head: we are behind, or it is invalid. Asking
-      // costs one message and tells the two apart.
+      // costs one message and tells the two apart. Not relayed: we could not
+      // check it, and the peers behind us will ask the same way.
       this.transport.send(from, frame(MsgType.ChainReq, encodeChainReq(this.chain.head())))
       return
     }
+    // Adopted means validated against our chain: certificate and every
+    // initiator. Only now does it travel on.
+    this.gossip.spread(bytes, from)
     this.maybeRequestKey(from)
   }
 
@@ -497,6 +523,10 @@ export class Session {
     this.grantPeer(from, m.keyEpochId) // grantPeer re-checks the ACL itself
   }
 }
+
+/** Live messages that travel beyond the neighbours, relayed byte for byte. Key,
+ *  Hello and the catch-up messages stay point to point. */
+const GOSSIPED = new Set<MsgType>([MsgType.Op, MsgType.AclRequest, MsgType.EpochPush])
 
 function eqBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false

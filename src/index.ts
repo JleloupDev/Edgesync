@@ -18,9 +18,11 @@ export type { ICrdt } from './ports/crdt'
 export type { ITransport, MessageHandler, PeerHandler } from './ports/transport'
 export { PeerStore, PinnedKeyChangedError, type KnownPeer, type PeerStatus } from './ports/peer-store'
 export type { IStorage } from './ports/storage'
+export type { IBroadcast } from './ports/broadcast'
 
 // Adapters (browser-safe only)
 export { YjsCrdt } from './adapters/yjs-crdt'
+export { FloodBroadcast } from './adapters/flood-broadcast'
 export { Bus, InProcessTransport } from './adapters/in-process-transport'
 export { InMemoryStorage } from './adapters/in-memory-storage'
 

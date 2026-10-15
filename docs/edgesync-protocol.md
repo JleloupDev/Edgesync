@@ -172,6 +172,14 @@ Message encadré = `[type:1][payload]`.
 > écritures de tous sous la signature de celui qui répond. Le canal de logs (§K)
 > repose sur cette distinction.
 
+**Gossip** ([ADR-0018](adr/0018-gossip-strategie-injectable.md)). `OP`,
+`ACL_REQUEST` et `EPOCH_PUSH` sont relayés au-delà des voisins, **à l'identique**,
+une seule fois par pair, et seulement après vérification (signature et droit de
+l'auteur ; pour une époque, après adoption). Un `OP` relayé reste donc signé par
+son auteur. La stratégie est un port injectable (`IBroadcast`) ; l'adaptateur par
+défaut, `FloodBroadcast`, envoie à tous les voisins sauf l'expéditeur. Le reste
+(`KEY`, `HELLO`, rattrapage) reste point à point.
+
 > **DÉCISION OUVERTE — Q4, périmètre des messages.**
 > *Proposé* : commencer **minimal** (`HELLO` + `OP` + `KEY`). *Alternative* :
 > inclure `SYNC_*` dès v0 — en P2P pur, la reconnexion d'un pair en retard est

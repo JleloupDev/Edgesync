@@ -83,10 +83,10 @@ de menace : un membre invité dont l'appareil est compromis, jamais un inconnu.
 
 ```
 src/core/      identity, envelope, keyring, acl-ops, acl-chain, codec
-src/ports/     ICrdt, ITransport, IStorage, PeerStore
-src/adapters/  Yjs, in-process, WebSocket, stockage
+src/ports/     ICrdt, ITransport, IBroadcast, IStorage, PeerStore
+src/adapters/  Yjs, in-process, WebSocket, stockage, diffusion par inondation
 src/protocol/  Session (l'orchestrateur), messages, persistance
-docs/adr/      les décisions structurantes, ADR-0001 à 0017
+docs/adr/      les décisions structurantes, ADR-0001 à 0018
 docs/          spécifications : ACL et arbitrage, modèle de canal, format de fil
 ```
 
@@ -97,7 +97,7 @@ stockage. C'est ce qui rend la couche auditable.
 
 ```bash
 npm install
-npm test          # 60 tests
+npm test          # 66 tests
 npm run typecheck
 npm run peer      # un pair sans interface, sur WebSocket
 ```

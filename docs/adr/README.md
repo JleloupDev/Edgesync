@@ -23,3 +23,8 @@ Décisions structurantes du protocole de collaboration P2P. Format MADR-lite :
 | [0011](0011-persistance-port-istorage.md) | Persistance via port `IStorage`, chiffrement au repos délégué à l'app | Accepté |
 | [0012](0012-verification-hors-bande-differee.md) | Vérification d'identité hors-bande différée (TOFU / S3 en v0) | Accepté (différé) |
 | [0013](0013-perimetre-v0-mvp.md) | Périmètre v0 (MVP) et limites différées | Accepté |
+| [0014](0014-chaine-epoques-ordre-faisant-autorite.md) | Chaîne d'époques : l'ordre faisant autorité | Accepté |
+| [0015](0015-arbitres-quorum-k1.md) | Arbitres : ordre seul, quorum impair, k=1 en v1 | Accepté |
+| [0016](0016-derivation-kdoc.md) | `K_doc` dérivée, et disparition des `docWrap` | Accepté |
+| [0017](0017-principals-et-groupes.md) | Principals, groupes, et la racine qui délègue à un groupe | Accepté |
+| [0018](0018-gossip-strategie-injectable.md) | Gossip : relais à l'identique, stratégie injectable | Accepté |
