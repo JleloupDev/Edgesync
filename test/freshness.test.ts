@@ -150,3 +150,32 @@ describe('fraicheur des demandes de droits (ADR-0019)', () => {
     expect(resolveAccess(b.chain.state(), b.identity.signPub)).toBe(Access.Read)
   })
 })
+
+describe('arbitres multiples sans accord (D42)', () => {
+  it('trois arbitres declares : les droits gelent, la chaine ne se scinde pas', async () => {
+    const bus = new Bus()
+    const founder = OwnIdentity.generate()
+    const { chain, keyring } = foundVault(founder)
+    const a = makePeer('A', bus, chain, keyring, founder)
+    const j = joiner()
+    const b = makePeer('B', bus, j.chain, j.keyring)
+    await settle()
+    const x = OwnIdentity.generate()
+    const y = OwnIdentity.generate()
+    a.session.requestAclChange(ROOT_GROUP, [
+      { t: 'set', principal: keyPrincipal(b.identity.signPub), access: Access.Read },
+      { t: 'set', principal: keyPrincipal(x.signPub), access: Access.Manage },
+      { t: 'set', principal: keyPrincipal(y.signPub), access: Access.Manage },
+      { t: 'arbiter', principal: keyPrincipal(x.signPub), on: true },
+      { t: 'arbiter', principal: keyPrincipal(y.signPub), on: true },
+    ])
+    await settle()
+    const gelee = chain.height()
+
+    // k = 3, quorum 2 : l'arbitre ne peut plus signer seul.
+    a.session.requestAclChange(ROOT_GROUP, set(OwnIdentity.generate(), Access.Read))
+    await settle()
+    expect(chain.height()).toBe(gelee)
+    expect(b.chain.head()).toEqual(chain.head())
+  })
+})

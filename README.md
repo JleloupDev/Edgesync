@@ -97,13 +97,15 @@ stockage. C'est ce qui rend la couche auditable.
 
 ```bash
 npm install
-npm test          # 80 tests
+npm test          # 81 tests
 npm run typecheck
 npm run peer      # un pair sans interface, sur WebSocket
 ```
 
 ## Documentation
 
+- [`docs/enjeux-ouverts.md`](docs/enjeux-ouverts.md) — ce qui tient, ce qui reste à
+  résoudre, et la preuve de chaque affirmation
 - [`docs/adr/`](docs/adr/) — les décisions, avec leur contexte et leurs conséquences
 - [`docs/edgesync-acl-arbitrage-spec.md`](docs/edgesync-acl-arbitrage-spec.md) — la
   spécification ACL complète : décisions, limites assumées, horizons

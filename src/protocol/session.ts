@@ -15,7 +15,7 @@ import {
 } from '../core/envelope'
 import { Keyring, keyCommitment } from '../core/keyring'
 import {
-  AclChain, arbiterSet, resolveAccess, signEpoch, epochId, type Epoch,
+  AclChain, arbiterSet, quorumSize, resolveAccess, signEpoch, epochId, type Epoch,
 } from '../core/acl-chain'
 import { Access, signAclOp, verifyAclOp, aclOpId, type AclChange, type AclOp } from '../core/acl-ops'
 import type { ICrdt } from '../ports/crdt'
@@ -206,6 +206,16 @@ export class Session {
    */
   mint(ops: AclOp[]): boolean {
     if (!this.isVaultRoot || !this.isArbiter()) return false
+
+    // D42 — at k=1 the arbiter's signature IS the certificate. With more arbiters
+    // it needs others', and the agreement between arbiters (C7) does not exist
+    // yet. Signing alone here used to advance the arbiter's own chain while
+    // every peer refused its epochs: a silent fork. Without a quorum the ACL
+    // FREEZES; it never diverges. Requests keep waiting.
+    if (quorumSize(arbiterSet(this.chain.state()).length) > 1) {
+      for (const op of ops) if (this.waiting.length < Session.MAX_WAITING) this.waiting.push(op)
+      return false
+    }
 
     // D39 — the arbiter checks the INITIATOR's signature before embedding an op,
     // exactly as every other peer will on receipt; and it only commits ops that
