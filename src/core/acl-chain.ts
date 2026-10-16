@@ -18,7 +18,7 @@ import { sha256 } from '@noble/hashes/sha2'
 import { concat } from './envelope'
 import { toHex } from './codec'
 import {
-  Access, ROOT_GROUP, principalId, decodeAclOp, encodeAclOp, verifyAclOp,
+  Access, ROOT_GROUP, principalId, decodeAclOp, encodeAclOp, verifyAclOp, aclOpId, touchedBy,
   type AclOp, type Principal,
 } from './acl-ops'
 
@@ -41,8 +41,10 @@ export interface Epoch {
   round: number
   ops: AclOp[]
   /**
-   * D11 — present IF AND ONLY IF the batch contains a `remove`. Rotating for
-   * anything else is waste, and an unjustified rotation must be detectable.
+   * D11 — present IF AND ONLY IF the batch takes the right to READ away from
+   * someone: a removal, but also a demotion below `read`, or a group losing its
+   * read. Rotating for anything else is waste, and an unjustified rotation must
+   * be detectable.
    *
    * This is a COMMITMENT — sha256(K_vault) — never the key itself. The chain is
    * public (Q2: the ACL is in clear, the only thing that breaks the "you need
@@ -275,9 +277,171 @@ export function quorumSize(k: number): number {
 
 // ── Applying ops ────────────────────────────────────────────────────────────
 
-/** Does this op batch contain a member removal? Drives D11. */
+/** Does this op batch contain a member removal? Kept for callers that only need
+ *  the syntactic question; the rotation rule is `losesRead`. */
 export function hasRemoval(ops: AclOp[]): boolean {
   return ops.some((o) => o.changes.some((c) => c.t === 'remove'))
+}
+
+/**
+ * D11 — did any key that could READ before stop being able to? That, and only
+ * that, forces a key rotation. Judged on the RESOLVED state, not on the verbs:
+ * a demotion from read to pull, or a group dropped below read, takes the key
+ * away just as surely as a removal — and used to leave it in place.
+ */
+export function losesRead(before: AclState, after: AclState): boolean {
+  for (const g of before.groups.values()) {
+    for (const pid of g.members.keys()) {
+      if (!pid.startsWith('k:')) continue
+      const signPub = fromHex(pid.slice(2))
+      const was = resolveAccess(before, signPub)
+      if (was === undefined || was < Access.Read) continue
+      const now = resolveAccess(after, signPub)
+      if (now === undefined || now < Access.Read) return true
+    }
+  }
+  return false
+}
+
+// ── Freshness: base, history, backlink (ADR-0019) ──────────────────────────
+//
+// An op is signed outside time, so on its own it is valid forever: replaying an
+// old admission after a revocation used to put the revoked member back. Three
+// rules anchor it, all judged on the chain alone so every peer reaches the same
+// verdict:
+//
+//   base      the head the initiator saw. No key rotation may lie between it and
+//             now: a rotation means someone lost the right to read, and every
+//             decision taken before it has to be taken again, knowingly.
+//   history   the ids of the ops applied since the last rotation. The same op
+//             never applies twice.
+//   backlink  `prev` = the initiator's previous op. An initiator's ops apply in
+//             the order it signed them, whatever order the network delivers.
+//
+// An op that fails them is INERT, exactly like an unauthorised one: it can sit
+// in an epoch and do nothing. So even a faulty arbiter cannot push it through.
+
+/** What one applied op left behind, for replay checks and conflict detection. */
+export interface OpRecord {
+  issuer: string
+  /** Height of the epoch that applied it. */
+  height: number
+  touched: Set<string>
+}
+
+/** Everything applied since the last key rotation. Reset by every rotation. */
+export interface KeyEpochHistory {
+  /** Height of the epoch that opened this key epoch. */
+  since: number
+  /** hex(opId) → record. */
+  ops: Map<string, OpRecord>
+  /** hex(issuer) → hex(opId) of its latest applied op. */
+  latest: Map<string, string>
+}
+
+export function emptyHistory(since = 0): KeyEpochHistory {
+  return { since, ops: new Map(), latest: new Map() }
+}
+
+function cloneHistory(h: KeyEpochHistory): KeyEpochHistory {
+  return { since: h.since, ops: new Map(h.ops), latest: new Map(h.latest) }
+}
+
+/**
+ * The verdict on one op, at one point of the chain:
+ *   ok            applies
+ *   wait          its predecessor (backlink) has not applied yet — hold it
+ *   stale         no base, unknown base, or a key rotation since its base
+ *   replay        already applied in this key epoch
+ *   fork          two ops behind the same predecessor — or two that both claim
+ *                 to be the initiator's first since the rotation: a signed
+ *                 equivocation, and the second one never applies
+ *   unauthorised  the initiator may not make this change
+ */
+export type Admission = 'ok' | 'wait' | 'stale' | 'replay' | 'fork' | 'unauthorised'
+
+export interface ChainHead {
+  id: Uint8Array
+  height: number
+  state: AclState
+  /** Omitted: nothing applied yet, as at the genesis. */
+  history?: KeyEpochHistory
+  /** Height of an epoch by id, -1 when unknown. Omitted: no base resolves. */
+  heightOf?: (id: Uint8Array) => number
+}
+
+export function admit(head: ChainHead, op: AclOp): Admission {
+  const history = head.history ?? emptyHistory()
+  if (!op.base) return 'stale'
+  const baseHeight = head.heightOf ? head.heightOf(op.base) : -1
+  if (baseHeight < 0 || baseHeight < history.since) return 'stale'
+  if (history.ops.has(toHex(aclOpId(op)))) return 'replay'
+
+  const latest = history.latest.get(toHex(op.issuer))
+  if (op.prev) {
+    const prev = toHex(op.prev)
+    if (latest !== prev) return history.ops.has(prev) ? 'fork' : 'wait'
+  } else if (latest !== undefined) {
+    return 'fork'
+  }
+  return applyOp(head.state, op) ? 'ok' : 'unauthorised'
+}
+
+/** Record an op that just applied. */
+function remember(history: KeyEpochHistory, op: AclOp, height: number): void {
+  const id = toHex(aclOpId(op))
+  const issuer = toHex(op.issuer)
+  history.ops.set(id, { issuer, height, touched: touchedBy(op) })
+  history.latest.set(issuer, id)
+}
+
+/** The result of applying one epoch on top of a head. */
+interface Applied {
+  state: AclState
+  history: KeyEpochHistory
+  /** The ops that took effect, in order. */
+  effective: AclOp[]
+  rotates: boolean
+}
+
+function applyEpoch(head: ChainHead, e: Omit<Epoch, 'sigs'>): Applied {
+  if (e.height === 0) {
+    // Bootstrap: no prior state to authorise against, no base to anchor on.
+    let state = head.state
+    for (const op of e.ops) state = applyOp(state, op, true) ?? state
+    return { state, history: emptyHistory(0), effective: e.ops.slice(), rotates: false }
+  }
+  let state = head.state
+  const history = cloneHistory(head.history ?? emptyHistory())
+  const effective: AclOp[] = []
+  for (const op of e.ops) {
+    if (admit({ ...head, state, history }, op) !== 'ok') continue
+    state = applyOp(state, op)!
+    remember(history, op, e.height)
+    effective.push(op)
+  }
+  const rotates = losesRead(head.state, state)
+  return { state, history: e.keyCommit ? emptyHistory(e.height) : history, effective, rotates }
+}
+
+/**
+ * Committed decisions on the same members, by someone else, that the initiator
+ * had not seen (applied after its base). Not a reason to refuse: two people
+ * deciding at once is legitimate, and who is right is not ours to say (D21,
+ * D34). But it is the one case where the order the arbiter picks silently
+ * decides the outcome, so it deserves to be seen.
+ */
+export function conflictsOf(head: ChainHead, op: AclOp): string[] {
+  const history = head.history ?? emptyHistory()
+  const baseHeight = op.base && head.heightOf ? head.heightOf(op.base) : -1
+  const mine = touchedBy(op)
+  const issuer = toHex(op.issuer)
+  const out: string[] = []
+  for (const [id, r] of history.ops) {
+    if (r.height <= baseHeight || r.issuer === issuer) continue
+    for (const p of r.touched) if (mine.has(p)) { out.push(id); break }
+  }
+  return out
 }
 
 /**
@@ -340,50 +504,51 @@ export function applyOp(state: AclState, op: AclOp, bootstrap = false): AclState
 
 /** Replay a chain into its state. Pure: same epochs in, same state out. */
 export function fold(epochs: Epoch[]): AclState {
-  let state = emptyState()
+  // Same admission rules as the live chain (ADR-0019), so a replay from disk can
+  // never reach a different state than the one the network agreed on. Height 0
+  // bootstraps: there is no prior state to authorise against. This is where the
+  // self-certifying vault id (C5) will attach — until then the root is trusted
+  // on first use.
+  const heights = new Map<string, number>()
+  let head: ChainHead = { id: GENESIS_PREV, height: -1, state: emptyState(), history: emptyHistory() }
   for (const e of epochs) {
-    for (const op of e.ops) {
-      // Height 0 bootstraps: there is no prior state to authorise against. This
-      // is where the self-certifying vault id (C5) will attach — until then the
-      // root is trusted on first use.
-      const next = applyOp(state, op, e.height === 0)
-      if (next) state = next
-    }
+    const applied = applyEpoch({ ...head, heightOf: (id) => heights.get(toHex(id)) ?? -1 }, e)
+    const id = epochId(e)
+    heights.set(toHex(id), e.height)
+    head = { id, height: e.height, state: applied.state, history: applied.history }
   }
-  return state
+  return head.state
 }
 
 // ── Validation (D31) ────────────────────────────────────────────────────────
-
-export interface ChainHead {
-  id: Uint8Array
-  height: number
-  state: AclState
-}
 
 /**
  * The five-point check of D31, plus D11. Returns a reason string when invalid,
  * undefined when the epoch is acceptable.
  */
 export function validateEpoch(vaultId: Uint8Array, e: Epoch, prev: ChainHead): string | undefined {
-  if (!eqBytes(e.prev, prev.id)) return 'prev mismatch'
-  if (e.height !== prev.height + 1) return 'height mismatch'
+  return checkEpoch(vaultId, e, prev).why
+}
 
-  // D11 — key material if and only if the batch removes someone. Height 0 is the
-  // one exemption: a vault has to start with a key, and there is nobody to
-  // remove yet.
-  if (e.height > 0 && hasRemoval(e.ops) !== (e.keyCommit !== undefined)) {
-    return 'key commitment does not match removals'
-  }
-  if (e.keyCommit && e.keyCommit.length !== 32) return 'key commitment size'
+function checkEpoch(vaultId: Uint8Array, e: Epoch, prev: ChainHead): { why?: string; applied?: Applied } {
+  if (!eqBytes(e.prev, prev.id)) return { why: 'prev mismatch' }
+  if (e.height !== prev.height + 1) return { why: 'height mismatch' }
 
   // D39 — every peer checks the INITIATOR's signature, not just the certificate.
-  for (const op of e.ops) if (!verifyAclOp(vaultId, op)) return 'op signature'
+  for (const op of e.ops) if (!verifyAclOp(vaultId, op)) return { why: 'op signature' }
+
+  // D11 — key material if and only if someone loses the right to read. Height 0
+  // is the one exemption: a vault has to start with a key.
+  const applied = applyEpoch(prev, e)
+  if (e.height > 0 && applied.rotates !== (e.keyCommit !== undefined)) {
+    return { why: 'key commitment does not match removals' }
+  }
+  if (e.keyCommit && e.keyCommit.length !== 32) return { why: 'key commitment size' }
 
   // The certificate is checked against the arbiters in force at prev — never
   // today's set, or a reconfiguration would invalidate history retroactively.
   const arbiters = arbiterSet(prev.state)
-  if (arbiters.length === 0) return 'no arbiter'
+  if (arbiters.length === 0) return { why: 'no arbiter' }
   const allowed = new Set(arbiters.map(toHex))
   const id = epochId(e)
   const region = epochSignRegion(vaultId, id)
@@ -398,8 +563,8 @@ export function validateEpoch(vaultId: Uint8Array, e: Epoch, prev: ChainHead): s
       /* invalid signature: ignore this one */
     }
   }
-  if (seen.size < quorumSize(arbiters.length)) return 'quorum not met'
-  return undefined
+  if (seen.size < quorumSize(arbiters.length)) return { why: 'quorum not met' }
+  return { applied }
 }
 
 // ── The chain ───────────────────────────────────────────────────────────────
@@ -409,6 +574,11 @@ export class AclChain {
   private readonly ids: Uint8Array[] = []
   /** states[i] is the state AFTER epochs[i] — kept incrementally, never refolded. */
   private readonly states: AclState[] = []
+  /** hex(epochId) → height: positions resolve in O(1). */
+  private readonly heights = new Map<string, number>()
+  /** What applied since the last key rotation, at the head (ADR-0019). Derived
+   *  from the epochs alone, so every peer holds the same one. */
+  private history: KeyEpochHistory = emptyHistory()
 
   constructor(readonly vaultId: Uint8Array) {}
 
@@ -426,28 +596,24 @@ export class AclChain {
   ): AclChain {
     const chain = new AclChain(vaultId)
     const draft = { prev: GENESIS_PREV, height: 0, round: 0, ops, keyCommit }
-    chain.push(signEpoch(vaultId, draft, founder.signPub, founder.sign))
+    chain.appendLocal(signEpoch(vaultId, draft, founder.signPub, founder.sign))
     return chain
   }
 
-  private push(e: Epoch): void {
+  private push(e: Epoch, applied: Applied): void {
     const id = epochId(e)
-    const base = this.states.length ? this.states[this.states.length - 1] : emptyState()
-    let state = base
-    for (const op of e.ops) {
-      const next = applyOp(state, op, e.height === 0)
-      if (next) state = next
-    }
     this.epochs.push(e)
     this.ids.push(id)
-    this.states.push(state)
+    this.states.push(applied.state)
+    this.heights.set(toHex(id), e.height)
+    this.history = applied.history
   }
 
   /** Validate then adopt. Throws with a reason — callers drop silently. */
   append(e: Epoch): void {
-    const why = validateEpoch(this.vaultId, e, this.headRef())
-    if (why) throw new Error(`epoch rejected: ${why}`)
-    this.push(e)
+    const { why, applied } = checkEpoch(this.vaultId, e, this.headRef())
+    if (why || !applied) throw new Error(`epoch rejected: ${why}`)
+    this.push(e, applied)
   }
 
   /**
@@ -460,7 +626,70 @@ export class AclChain {
     for (const op of e.ops) {
       if (!verifyAclOp(this.vaultId, op)) throw new Error('epoch rejected: op signature')
     }
-    this.push(e)
+    this.push(e, applyEpoch(this.headRef(), e))
+  }
+
+  // ── Freshness, for whoever builds or relays requests (ADR-0019) ───────────
+
+  /** The verdict on one op if it were committed now. */
+  admit(op: AclOp): Admission {
+    return admit(this.headRef(), op)
+  }
+
+  /**
+   * Sort a batch the way the next epoch would: what applies, in an order that
+   * honours every backlink (an op waits for its predecessor even inside one
+   * batch), what has to wait, what will never apply. Plus whether the result
+   * takes the right to read from anyone — D11's rotation.
+   */
+  preview(ops: AclOp[]): { applicable: AclOp[]; waiting: AclOp[]; refused: AclOp[]; rotates: boolean } {
+    const head = this.headRef()
+    let state = head.state
+    const history = cloneHistory(this.history)
+    const applicable: AclOp[] = []
+    const refused: AclOp[] = []
+    let pending = ops.slice()
+    for (let progress = true; progress && pending.length;) {
+      progress = false
+      const again: AclOp[] = []
+      for (const op of pending) {
+        const verdict = verifyAclOp(this.vaultId, op) ? admit({ ...head, state, history }, op) : 'unauthorised'
+        if (verdict === 'ok') {
+          state = applyOp(state, op)!
+          remember(history, op, head.height + 1)
+          applicable.push(op)
+          progress = true
+        } else if (verdict === 'wait') {
+          again.push(op)
+        } else {
+          refused.push(op)
+        }
+      }
+      pending = again
+    }
+    return { applicable, waiting: pending, refused, rotates: losesRead(head.state, state) }
+  }
+
+  /** The initiator's latest applied op since the last rotation: what its next
+   *  op names as `prev`. */
+  latestOf(issuer: Uint8Array): Uint8Array | undefined {
+    const id = this.history.latest.get(toHex(issuer))
+    return id ? fromHex(id) : undefined
+  }
+
+  /** Has this op applied since the last rotation? */
+  applied(opId: Uint8Array): boolean {
+    return this.history.ops.has(toHex(opId))
+  }
+
+  /** See `conflictsOf`. */
+  conflicts(op: AclOp): string[] {
+    return conflictsOf(this.headRef(), op)
+  }
+
+  /** Height of the epoch that opened the current key epoch. */
+  keyEpochHeight(): number {
+    return this.history.since
   }
 
   /**
@@ -476,7 +705,10 @@ export class AclChain {
   }
 
   private headRef(): ChainHead {
-    return { id: this.head(), height: this.height(), state: this.state() }
+    return {
+      id: this.head(), height: this.height(), state: this.state(), history: this.history,
+      heightOf: (id) => this.heights.get(toHex(id)) ?? -1,
+    }
   }
 
   head(): Uint8Array {
@@ -529,9 +761,7 @@ export class AclChain {
   }
 
   private indexOf(id: Uint8Array): number {
-    const h = toHex(id)
-    for (let i = this.ids.length - 1; i >= 0; i--) if (toHex(this.ids[i]) === h) return i
-    return -1
+    return this.heights.get(toHex(id)) ?? -1
   }
 }
 

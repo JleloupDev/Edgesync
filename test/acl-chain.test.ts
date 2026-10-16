@@ -9,9 +9,10 @@ import { sha256 } from '@noble/hashes/sha2'
 import { OwnIdentity } from '../src/core/identity'
 import { resourceId, randomBytes } from '../src/core/envelope'
 import {
-  Access, ROOT_GROUP, signAclOp, verifyAclOp, encodeAclOp, decodeAclOp,
+  Access, ROOT_GROUP, signAclOp, verifyAclOp, encodeAclOp, decodeAclOp, aclOpId,
   keyPrincipal, groupPrincipal, type AclOp,
 } from '../src/core/acl-ops'
+import { toHex } from '../src/core/codec'
 import {
   AclChain, signEpoch, epochId, encodeEpoch, decodeEpoch, validateEpoch,
   resolveAccess, isOwner, arbiterSet, quorumSize, fold, GENESIS_PREV,
@@ -24,6 +25,21 @@ const idOf = (o: OwnIdentity) => ({ signPub: o.signPub, sign: (m: Uint8Array) =>
 const op = (issuer: OwnIdentity, group: Uint8Array, changes: AclOp['changes']) =>
   signAclOp(VAULT, { group, changes, issuer: issuer.signPub }, (m) => issuer.sign(m))
 
+type Item = [OwnIdentity, Uint8Array, AclOp['changes']]
+
+/** Ops the way a well-behaved initiator signs them (ADR-0019): anchored on the
+ *  head it sees, each chained to the same initiator's previous op. */
+function batch(chain: AclChain, ...items: Item[]): AclOp[] {
+  const tails = new Map<string, Uint8Array | undefined>()
+  return items.map(([issuer, group, changes]) => {
+    const k = toHex(issuer.signPub)
+    const prev = tails.has(k) ? tails.get(k) : chain.latestOf(issuer.signPub)
+    const o = signAclOp(VAULT, { group, changes, issuer: issuer.signPub, base: chain.head(), prev }, (m) => issuer.sign(m))
+    tails.set(k, aclOpId(o))
+    return o
+  })
+}
+
 /** Genesis: the founder is manage inside the owners GROUP, and the root
  *  delegates to that group — never to the individual (D19). */
 function genesis(founder: OwnIdentity) {
@@ -35,6 +51,9 @@ function genesis(founder: OwnIdentity) {
     ]),
   ], randomBytes(32))
 }
+
+const one = (c: AclChain, issuer: OwnIdentity, group: Uint8Array, changes: AclOp['changes']) =>
+  batch(c, [issuer, group, changes])[0]
 
 /** Build + sign the next epoch as `by` (k=1: one signature IS the certificate). */
 function next(chain: AclChain, by: OwnIdentity, ops: AclOp[], keyCommit?: Uint8Array) {
@@ -84,7 +103,7 @@ describe('acl-chain — la chaine', () => {
     const bob = OwnIdentity.generate()
     const c = genesis(f)
 
-    const add = op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])
+    const add = one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])
     c.append(next(c, f, [add]))
     expect(resolveAccess(c.state(), bob.signPub)).toBe(Access.Write)
 
@@ -109,14 +128,14 @@ describe('acl-chain — la chaine', () => {
     const f = OwnIdentity.generate()
     const bob = OwnIdentity.generate()
     const c = genesis(f)
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
 
     // une cle sans retrait
     const gratuit = next(c, f, [], randomBytes(32))
     expect(() => c.append(gratuit)).toThrow(/key commitment/)
 
     // un retrait sans cle
-    const rm = op(f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(bob.signPub) }])
+    const rm = one(c, f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(bob.signPub) }])
     expect(() => c.append(next(c, f, [rm]))).toThrow(/key commitment/)
 
     // les deux ensemble : accepte
@@ -131,13 +150,13 @@ describe('acl-chain — la chaine', () => {
     const keyEpoch0 = c.head()
 
     // deux epoques SANS cle : la position avance, la cle ne bouge pas
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Read }])]))
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Read }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
     expect(c.head()).not.toEqual(keyEpoch0)
     expect(c.keyEpochAt(c.head())).toEqual(keyEpoch0)
 
     // une revocation : nouvelle cle, la position et la cle coincident a nouveau
-    const rm = op(f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(bob.signPub) }])
+    const rm = one(c, f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(bob.signPub) }])
     c.append(next(c, f, [rm], randomBytes(32)))
     expect(c.keyEpochAt(c.head())).toEqual(c.head())
   })
@@ -145,7 +164,7 @@ describe('acl-chain — la chaine', () => {
   it('encode/decode une epoque a l\'octet pres', () => {
     const f = OwnIdentity.generate()
     const c = genesis(f)
-    const e = next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(f.signPub), access: Access.Manage }])], randomBytes(32))
+    const e = next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(f.signPub), access: Access.Manage }])], randomBytes(32))
     const back = decodeEpoch(encodeEpoch(e))
     expect(back).toEqual(e)
     expect(epochId(back)).toEqual(epochId(e))
@@ -167,11 +186,11 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const bob = OwnIdentity.generate()
     const mallory = OwnIdentity.generate()
     const c = genesis(f)
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
 
     // bob (write) tente de s'octroyer manage : l'op est signee et valide, mais
     // le fold la refuse -> elle n'a aucun effet.
-    const grab = op(bob, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(mallory.signPub), access: Access.Read }])
+    const grab = one(c, bob, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(mallory.signPub), access: Access.Read }])
     c.append(next(c, f, [grab]))
     expect(resolveAccess(c.state(), mallory.signPub)).toBeUndefined()
   })
@@ -183,16 +202,16 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const c = genesis(f)
 
     // le fondateur (owner) peut creer un manage
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(admin.signPub), access: Access.Manage }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(admin.signPub), access: Access.Manage }])]))
     expect(resolveAccess(c.state(), admin.signPub)).toBe(Access.Manage)
     expect(isOwner(c.state(), admin.signPub)).toBe(false)
 
     // cet admin, qui n'est PAS owner, ne peut pas en creer un autre
-    c.append(next(c, f, [op(admin, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(cible.signPub), access: Access.Manage }])]))
+    c.append(next(c, f, [one(c, admin, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(cible.signPub), access: Access.Manage }])]))
     expect(resolveAccess(c.state(), cible.signPub)).toBeUndefined()
 
     // mais il peut accorder en dessous de lui
-    c.append(next(c, f, [op(admin, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(cible.signPub), access: Access.Write }])]))
+    c.append(next(c, f, [one(c, admin, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(cible.signPub), access: Access.Write }])]))
     expect(resolveAccess(c.state(), cible.signPub)).toBe(Access.Write)
   })
 
@@ -203,10 +222,10 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const c = genesis(f)
 
     // Carol est manage DANS l'equipe, mais l'equipe n'a que read sur le vault.
-    c.append(next(c, f, [
-      op(f, TEAM, [{ t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Manage }]),
-      op(f, ROOT_GROUP, [{ t: 'set', principal: groupPrincipal(TEAM), access: Access.Read }]),
-    ]))
+    c.append(next(c, f, batch(c,
+      [f, TEAM, [{ t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Manage }]],
+      [f, ROOT_GROUP, [{ t: 'set', principal: groupPrincipal(TEAM), access: Access.Read }]],
+    )))
     expect(resolveAccess(c.state(), carol.signPub)).toBe(Access.Read)
   })
 
@@ -215,32 +234,34 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const carol = OwnIdentity.generate()
     const TEAM = sha256(new TextEncoder().encode('equipe-design'))
     const c = genesis(f)
-    c.append(next(c, f, [
-      op(f, TEAM, [{ t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Manage }]),
-      op(f, ROOT_GROUP, [
+    c.append(next(c, f, batch(c,
+      [f, TEAM, [{ t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Manage }]],
+      [f, ROOT_GROUP, [
         { t: 'set', principal: groupPrincipal(TEAM), access: Access.Read },
         { t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Write }, // en direct
-      ]),
-    ]))
+      ]],
+    )))
     expect(resolveAccess(c.state(), carol.signPub)).toBe(Access.Write)
   })
 
   it('D17 : un groupe ne peut jamais etre vide de ses manage', () => {
     const f = OwnIdentity.generate()
     const c = genesis(f)
-    // le fondateur est le seul manage du groupe owners : se retirer est refuse
-    const suicide = op(f, OWNERS, [{ t: 'remove', principal: keyPrincipal(f.signPub) }])
-    c.append(next(c, f, [suicide], randomBytes(32)))
+    // le fondateur est le seul manage du groupe owners : se retirer est refuse.
+    // Refuse, donc personne ne perd la lecture : pas de rotation (D11).
+    const suicide = one(c, f, OWNERS, [{ t: 'remove', principal: keyPrincipal(f.signPub) }])
+    expect(() => c.append(next(c, f, [suicide], randomBytes(32)))).toThrow(/key commitment/)
+    c.append(next(c, f, [suicide]))
     expect(resolveAccess(c.state(), f.signPub)).toBe(Access.Manage) // toujours la
 
     // et un lot qui viderait le groupe est refuse EN ENTIER, pas a moitie
     const second = OwnIdentity.generate()
-    c.append(next(c, f, [op(f, OWNERS, [{ t: 'set', principal: keyPrincipal(second.signPub), access: Access.Manage }])]))
-    const vider = op(f, OWNERS, [
+    c.append(next(c, f, [one(c, f, OWNERS, [{ t: 'set', principal: keyPrincipal(second.signPub), access: Access.Manage }])]))
+    const vider = one(c, f, OWNERS, [
       { t: 'remove', principal: keyPrincipal(f.signPub) },
       { t: 'remove', principal: keyPrincipal(second.signPub) },
     ])
-    c.append(next(c, f, [vider], randomBytes(32)))
+    c.append(next(c, f, [vider]))
     expect(resolveAccess(c.state(), f.signPub)).toBe(Access.Manage)
     expect(resolveAccess(c.state(), second.signPub)).toBe(Access.Manage)
   })
@@ -254,14 +275,14 @@ describe('acl-chain — les invariants de l\'etat', () => {
     expect(quorumSize(1)).toBe(1)
 
     // deux declares -> on ecarte le moins gradé pour rester impair
-    c.append(next(c, f, [op(f, ROOT_GROUP, [
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [
       { t: 'set', principal: keyPrincipal(a.signPub), access: Access.Manage },
       { t: 'arbiter', principal: keyPrincipal(a.signPub), on: true },
     ])]))
     expect(arbiterSet(c.state())).toHaveLength(1)
 
     // trois declares -> k = 3, quorum 2
-    c.append(next(c, f, [op(f, ROOT_GROUP, [
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [
       { t: 'set', principal: keyPrincipal(b.signPub), access: Access.Manage },
       { t: 'arbiter', principal: keyPrincipal(b.signPub), on: true },
     ])]))
@@ -276,7 +297,7 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const f = OwnIdentity.generate()
     const bob = OwnIdentity.generate()
     const c = genesis(f)
-    c.append(next(c, f, [op(f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Write }])]))
     const refolded = fold(c.all())
     expect(resolveAccess(refolded, bob.signPub)).toBe(resolveAccess(c.state(), bob.signPub))
     expect(resolveAccess(refolded, f.signPub)).toBe(Access.Manage)
@@ -288,5 +309,125 @@ describe('acl-chain — les invariants de l\'etat', () => {
     const e = next(c, f, [])
     const why = validateEpoch(VAULT, e, { id: c.head(), height: c.height(), state: c.state() })
     expect(why).toBeUndefined()
+  })
+})
+
+describe('D11 — la cle tourne des qu\'on perd la lecture', () => {
+  it('passer de read a pull fait tourner la cle, comme un retrait', () => {
+    const f = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const c = genesis(f)
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Read }])]))
+
+    const down = one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(bob.signPub), access: Access.Pull }])
+    expect(() => c.append(next(c, f, [down]))).toThrow(/key commitment/)
+    c.append(next(c, f, [down], randomBytes(32)))
+    expect(resolveAccess(c.state(), bob.signPub)).toBe(Access.Pull)
+  })
+
+  it('un groupe qui passe sous read fait tourner la cle pour tous ses membres', () => {
+    const f = OwnIdentity.generate()
+    const carol = OwnIdentity.generate()
+    const TEAM = sha256(new TextEncoder().encode('equipe'))
+    const c = genesis(f)
+    c.append(next(c, f, batch(c,
+      [f, TEAM, [{ t: 'set', principal: keyPrincipal(f.signPub), access: Access.Manage }, { t: 'set', principal: keyPrincipal(carol.signPub), access: Access.Write }]],
+      [f, ROOT_GROUP, [{ t: 'set', principal: groupPrincipal(TEAM), access: Access.Write }]],
+    )))
+    const down = one(c, f, ROOT_GROUP, [{ t: 'set', principal: groupPrincipal(TEAM), access: Access.Pull }])
+    expect(() => c.append(next(c, f, [down]))).toThrow(/key commitment/)
+  })
+
+  it('retirer un relais qui n\'avait que pull ne fait pas tourner la cle', () => {
+    const f = OwnIdentity.generate()
+    const relais = OwnIdentity.generate()
+    const c = genesis(f)
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'set', principal: keyPrincipal(relais.signPub), access: Access.Pull }])]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(relais.signPub) }])]))
+    expect(resolveAccess(c.state(), relais.signPub)).toBeUndefined()
+  })
+})
+
+describe('ADR-0019 — base, historique, backlink', () => {
+  const set = (who: OwnIdentity, access: Access): AclOp['changes'] =>
+    [{ t: 'set', principal: keyPrincipal(who.signPub), access }]
+
+  it('le rejeu d\'une admission apres une revocation reste inerte', () => {
+    const f = OwnIdentity.generate()
+    const p2 = OwnIdentity.generate()
+    const c = genesis(f)
+    const admission = one(c, f, ROOT_GROUP, set(p2, Access.Write))
+    c.append(next(c, f, [admission]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(p2.signPub) }])], randomBytes(32)))
+
+    // La meme op, remise dans une epoque par un arbitre fautif : sa base est
+    // d'avant la rotation, elle n'a aucun effet.
+    expect(c.admit(admission)).toBe('stale')
+    c.append(next(c, f, [admission]))
+    expect(resolveAccess(c.state(), p2.signPub)).toBeUndefined()
+  })
+
+  it('dans une meme epoque de cle, le rejeu exact est inerte, la vraie re-promotion passe', () => {
+    const f = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const c = genesis(f)
+    const promo = one(c, f, ROOT_GROUP, set(bob, Access.Manage))
+    c.append(next(c, f, [promo]))
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, set(bob, Access.Write))])) // pas de perte de lecture : pas de rotation
+
+    expect(c.admit(promo)).toBe('replay')
+    c.append(next(c, f, [promo]))
+    expect(resolveAccess(c.state(), bob.signPub)).toBe(Access.Write)
+
+    // Re-signee aujourd'hui : autre base, autre hash.
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, set(bob, Access.Manage))]))
+    expect(resolveAccess(c.state(), bob.signPub)).toBe(Access.Manage)
+  })
+
+  it('une demande signee avant une rotation est perimee, meme jamais committee', () => {
+    const f = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const carol = OwnIdentity.generate()
+    const c = genesis(f)
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, set(bob, Access.Write))]))
+    const enRoute = one(c, f, ROOT_GROUP, set(carol, Access.Write)) // signee, pas encore committee
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, [{ t: 'remove', principal: keyPrincipal(bob.signPub) }])], randomBytes(32)))
+    expect(c.admit(enRoute)).toBe('stale')
+  })
+
+  it('le backlink remet dans l\'ordre les demandes d\'un meme emetteur', () => {
+    const f = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const c = genesis(f)
+    // f signe « bob lecteur » puis « bob admin » ; le reseau les livre a l'envers.
+    const [lecteur, admin] = batch(c, [f, ROOT_GROUP, set(bob, Access.Read)], [f, ROOT_GROUP, set(bob, Access.Manage)])
+    expect(c.admit(admin)).toBe('wait')
+    const p = c.preview([admin, lecteur])
+    expect(p.applicable).toEqual([lecteur, admin])
+    c.append(next(c, f, p.applicable))
+    expect(resolveAccess(c.state(), bob.signPub)).toBe(Access.Manage)
+  })
+
+  it('deux ops differentes derriere le meme predecesseur : la seconde est une equivocation', () => {
+    const f = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const c = genesis(f)
+    const [a] = batch(c, [f, ROOT_GROUP, set(bob, Access.Read)])
+    const [b] = batch(c, [f, ROOT_GROUP, set(bob, Access.Write)]) // meme prev que a
+    c.append(next(c, f, [a]))
+    expect(c.admit(b)).toBe('fork')
+  })
+
+  it('une decision sur un membre deja modifie par un autre, a son insu, est signalee', () => {
+    const f = OwnIdentity.generate()
+    const admin = OwnIdentity.generate()
+    const bob = OwnIdentity.generate()
+    const c = genesis(f)
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, set(admin, Access.Manage))]))
+    const [deAdmin] = batch(c, [admin, ROOT_GROUP, set(bob, Access.Read)]) // admin n'a pas vu la suite
+    c.append(next(c, f, [one(c, f, ROOT_GROUP, set(bob, Access.Write))]))
+
+    expect(c.admit(deAdmin)).toBe('ok') // legitime : il s'applique
+    expect(c.conflicts(deAdmin)).toHaveLength(1) // mais le conflit est visible
   })
 })

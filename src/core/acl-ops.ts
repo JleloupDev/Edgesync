@@ -66,6 +66,20 @@ export interface AclOp {
   changes: AclChange[]
   /** signPub of the initiator. */
   issuer: Uint8Array
+  /**
+   * The chain head the initiator saw when signing (ADR-0019). Signed, so an op
+   * is anchored in time: it stops applying as soon as a key rotation happens
+   * after its base, which is what kills the replay of an old request. Only the
+   * genesis ops have none — there is no chain yet to point at.
+   */
+  base?: Uint8Array
+  /**
+   * Backlink: the id of this initiator's PREVIOUS op (ADR-0019). Orders one
+   * initiator's decisions even when the network reorders them, and makes two
+   * different ops behind the same predecessor a signed equivocation. Absent for
+   * the first op of an initiator since the last key rotation.
+   */
+  prev?: Uint8Array
   /** Initiator's signature over the canonical body (D39). */
   sig: Uint8Array
 }
@@ -92,7 +106,8 @@ export function groupPrincipal(groupId: Uint8Array): Principal {
 //
 //   Principal   [kind:1][id:32]                       kind 0 = key, 1 = group
 //   AclChange   [t:1][principal:33]( [access:1] | [on:1] | )
-//   body        [group:32][count:u32][changes…][issuer:32]
+//   body        [group:32][count:u32][changes…][issuer:32][flags:1]([base:32])([prev:32])
+//               flags bit 0 = base present, bit 1 = prev present
 //   wire        [body][sig:64]
 
 function encodePrincipal(p: Principal): Uint8Array {
@@ -115,7 +130,11 @@ function u32(n: number): Uint8Array {
 
 /** The signed region of an op: everything except the signature. */
 export function aclOpBody(op: Omit<AclOp, 'sig'>): Uint8Array {
-  return concat(op.group, u32(op.changes.length), ...op.changes.map(encodeChange), op.issuer)
+  const flags = (op.base ? 1 : 0) | (op.prev ? 2 : 0)
+  return concat(
+    op.group, u32(op.changes.length), ...op.changes.map(encodeChange), op.issuer,
+    new Uint8Array([flags]), op.base ?? new Uint8Array(0), op.prev ?? new Uint8Array(0),
+  )
 }
 
 export function encodeAclOp(op: AclOp): Uint8Array {
@@ -159,8 +178,13 @@ export function decodeAclOp(b: Uint8Array): { op: AclOp; read: number } {
     else throw new Error('aclop: unknown change type')
   }
   const issuer = take(PUB)
-  const sig = take(SIG)
-  return { op: { group, changes, issuer, sig }, read: o }
+  const flags = take(1)[0]
+  if (flags > 3) throw new Error('aclop: unknown flags')
+  const op: AclOp = { group, changes, issuer, sig: new Uint8Array(0) }
+  if (flags & 1) op.base = take(ID)
+  if (flags & 2) op.prev = take(ID)
+  op.sig = take(SIG)
+  return { op, read: o }
 }
 
 // ── Signing ─────────────────────────────────────────────────────────────────
@@ -190,7 +214,15 @@ export function verifyAclOp(vaultId: Uint8Array, op: AclOp): boolean {
   }
 }
 
-/** Content-addressed id of an op — used by reports and by tests. */
+/** Content-addressed id of an op: what the history, the backlinks and the
+ *  reports refer to. Ed25519 is deterministic, so the same draft signed twice
+ *  gives the same id — the `base` is what tells two equal decisions apart. */
 export function aclOpId(op: AclOp): Uint8Array {
   return sha256(encodeAclOp(op))
+}
+
+/** Stable ids of the principals an op changes: what "touching a member" means
+ *  for conflict detection. */
+export function touchedBy(op: AclOp): Set<string> {
+  return new Set(op.changes.map((c) => principalId(c.principal)))
 }

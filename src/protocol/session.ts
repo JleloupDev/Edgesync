@@ -15,9 +15,9 @@ import {
 } from '../core/envelope'
 import { Keyring, keyCommitment } from '../core/keyring'
 import {
-  AclChain, arbiterSet, resolveAccess, hasRemoval, signEpoch, epochId, applyOp, type Epoch,
+  AclChain, arbiterSet, resolveAccess, signEpoch, epochId, type Epoch,
 } from '../core/acl-chain'
-import { Access, signAclOp, verifyAclOp, type AclChange, type AclOp } from '../core/acl-ops'
+import { Access, signAclOp, verifyAclOp, aclOpId, type AclChange, type AclOp } from '../core/acl-ops'
 import type { ICrdt } from '../ports/crdt'
 import type { ITransport } from '../ports/transport'
 import type { IBroadcast } from '../ports/broadcast'
@@ -65,6 +65,11 @@ export interface SessionOpts {
    *  arbiters: a changed pinned key proves nothing (a transport id is bound to
    *  no identity), and routing suspicions would open a false-accusation flood. */
   onSecurityAlert?: (alert: { kind: 'pinned-key-changed'; peer: string }) => void
+  /** Raised by an ARBITER when it commits a decision on members that someone
+   *  else changed after the initiator's base — two people deciding at once,
+   *  neither having seen the other (ADR-0019). The arbiter still commits: who is
+   *  right is not the protocol's call (D21, D34). This only makes it visible. */
+  onAclConflict?: (conflict: { op: AclOp; with: string[] }) => void
 }
 
 export class Session {
@@ -79,7 +84,18 @@ export class Session {
   private readonly resourceId: Uint8Array
   private readonly storage?: IStorage
   private readonly onSecurityAlert?: SessionOpts['onSecurityAlert']
+  private readonly onAclConflict?: SessionOpts['onAclConflict']
   private readonly idByPeer = new Map<string, PeerIdentity>()
+
+  /** Our own last request, while it may still be in flight: our next one names
+   *  it as `prev`, so the arbiter applies them in the order we signed them. */
+  private ownTail?: { id: Uint8Array; keyEpoch: number }
+
+  /** Arbiter only: requests whose predecessor has not applied yet (ADR-0019).
+   *  Bounded, and emptied by every key rotation — anything signed before one is
+   *  stale anyway. */
+  private readonly waiting: AclOp[] = []
+  private static readonly MAX_WAITING = 1000
   private readonly cleanups: (() => void)[] = []
   private readonly rand = () => randomBytes(32)
 
@@ -105,6 +121,7 @@ export class Session {
     this.resourceId = resourceId(o.resource)
     this.storage = o.storage
     this.onSecurityAlert = o.onSecurityAlert
+    this.onAclConflict = o.onAclConflict
     this.isVaultRoot = eqBytes(this.resourceId, o.chain.vaultId)
 
     this.cleanups.push(this.crdt.onLocalUpdate((u) => this.publishOp(u)))
@@ -148,17 +165,33 @@ export class Session {
    * intent, never from a time window — so a revocation takes effect as soon as
    * the arbiter orders it, not at the end of some interval.
    */
-  requestAclChange(group: Uint8Array, changes: AclChange[]): void {
+  requestAclChange(group: Uint8Array, changes: AclChange[]): AclOp {
+    // ADR-0019 — anchored on what we have seen (base), and chained to our own
+    // previous request (prev). Our last request still in flight is the one to
+    // name; once it has applied, the chain is the authority on what came last.
+    // A tail from before the last rotation is dropped: it is stale now.
+    const keyEpoch = this.chain.keyEpochHeight()
+    const inFlight = this.ownTail && this.ownTail.keyEpoch === keyEpoch && !this.chain.applied(this.ownTail.id)
+    const tail = inFlight ? this.ownTail!.id : undefined
     const op = signAclOp(
       this.chain.vaultId,
-      { group, changes, issuer: this.id.signPub },
+      {
+        group, changes, issuer: this.id.signPub,
+        base: this.chain.head(), prev: tail ?? this.chain.latestOf(this.id.signPub),
+      },
       (m) => this.id.sign(m),
     )
+    // A request that cannot apply even on our own head will be refused by the
+    // arbiter too. It must not become a link of our chain, or every later
+    // request would wait forever behind a predecessor that never applies.
+    const verdict = this.chain.admit(op)
+    if (verdict === 'ok' || verdict === 'wait') this.ownTail = { id: aclOpId(op), keyEpoch }
     // Gossip it regardless: a request has no effect until it is in an epoch, so
     // circulating it costs nothing, and every peer that can check it relays it —
     // which is how it reaches an arbiter we are not adjacent to.
     this.gossip.spread(frame(MsgType.AclRequest, encodeAclRequest(op)))
     this.mint([op])
+    return op
   }
 
   /** Are WE the arbiter? Computed from the ACL, never from presence (D28). */
@@ -175,34 +208,29 @@ export class Session {
     if (!this.isVaultRoot || !this.isArbiter()) return false
 
     // D39 — the arbiter checks the INITIATOR's signature before embedding an op,
-    // exactly as every other peer will on receipt. Skipping it corrupts only the
-    // arbiter: peers reject the epoch at validateEpoch, but the arbiter has
-    // already folded the forged op into its own state and goes on minting from
-    // there. Ordering is the arbiter's job; vouching for content is not.
-    ops = ops.filter((op) => verifyAclOp(this.chain.vaultId, op))
+    // exactly as every other peer will on receipt; and it only commits ops that
+    // would actually APPLY. Without that dry run, a correctly-signed but
+    // unauthorised op still produced an epoch — a real link with no effect —
+    // so ANY keypair could force one epoch per request.
+    //
+    // ADR-0019 — the same dry run enforces freshness: a stale or replayed op is
+    // dropped, and an op whose predecessor has not applied yet WAITS here, in
+    // the order its initiator signed them, instead of overtaking it.
+    const { applicable, waiting, rotates } = this.chain.preview([...this.waiting.splice(0), ...ops])
+    for (const op of waiting) if (this.waiting.length < Session.MAX_WAITING) this.waiting.push(op)
+    if (applicable.length === 0) return false
+    ops = applicable
 
-    // …and only commits ops that would actually APPLY. Without this dry run, a
-    // correctly-signed but unauthorised op still produced an epoch — one with no
-    // effect on the state, but a real link in the chain. Which means ANY peer,
-    // member or not, could force one epoch per request: unbounded amplification
-    // from an attacker who holds nothing but a keypair.
-    let probe = this.chain.state()
-    const effective: AclOp[] = []
-    for (const op of ops) {
-      const next = applyOp(probe, op)
-      if (!next) continue
-      probe = next
-      effective.push(op)
+    if (this.onAclConflict) {
+      for (const op of ops) {
+        const clash = this.chain.conflicts(op)
+        if (clash.length) this.onAclConflict({ op, with: clash })
+      }
     }
-    if (effective.length === 0) return false
-    ops = effective
 
     const height = this.chain.height() + 1
     const round = 0
     const slot = `${height}/${round}`
-
-    // D11 — key material if and only if the batch removes someone.
-    const rotates = hasRemoval(ops)
     const vaultKey = rotates ? this.rand() : undefined
     const draft = {
       prev: this.chain.head(), height, round, ops,
@@ -212,7 +240,11 @@ export class Session {
 
     // D38 — refuse to sign a second, different candidate at this slot.
     const already = this.signedAt.get(slot)
-    if (already && already !== hex(id)) return false
+    if (already && already !== hex(id)) {
+      // Not lost: they try again at the next height.
+      this.waiting.unshift(...ops)
+      return false
+    }
     this.signedAt.set(slot, hex(id))
 
     const epoch = signEpoch(this.chain.vaultId, draft, this.id.signPub, (m) => this.id.sign(m))
@@ -225,6 +257,8 @@ export class Session {
     // removal), so keying the newcomer cannot be tied to a rotation happening.
     // grantPeer re-checks the ACL itself, so this is a no-op for anyone else.
     for (const p of this.transport.peers()) this.grantPeer(p)
+    // Something that waited on one of these ops may apply now.
+    if (this.waiting.length) this.mint([])
     return true
   }
 
@@ -434,10 +468,13 @@ export class Session {
   private onAclRequest(from: string, payload: Uint8Array, bytes: Uint8Array): void {
     if (!this.isVaultRoot) return
     const op = decodeAclRequest(payload)
-    // Relay only what would apply on our head: correctly signed AND issued by
-    // someone allowed to make that change. A request nobody may grant dies at
-    // the first hop instead of costing every peer a verification.
-    if (!verifyAclOp(this.chain.vaultId, op) || !applyOp(this.chain.state(), op)) return
+    // Relay only what could apply on our head: correctly signed, fresh, not a
+    // replay, issued by someone allowed to make that change — or waiting on its
+    // initiator's previous request. Anything else dies at the first hop instead
+    // of costing every peer a verification.
+    if (!verifyAclOp(this.chain.vaultId, op)) return
+    const verdict = this.chain.admit(op)
+    if (verdict !== 'ok' && verdict !== 'wait') return
     this.gossip.spread(bytes, from)
     // Signature and authorisation of the INITIATOR are checked again by the fold
     // and by validateEpoch (D39) — an arbiter cannot smuggle in an op nobody

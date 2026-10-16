@@ -28,3 +28,4 @@ Décisions structurantes du protocole de collaboration P2P. Format MADR-lite :
 | [0016](0016-derivation-kdoc.md) | `K_doc` dérivée, et disparition des `docWrap` | Accepté |
 | [0017](0017-principals-et-groupes.md) | Principals, groupes, et la racine qui délègue à un groupe | Accepté |
 | [0018](0018-gossip-strategie-injectable.md) | Gossip : relais à l'identique, stratégie injectable | Accepté |
+| [0019](0019-fraicheur-des-demandes-de-droits.md) | Fraîcheur des demandes de droits : base, historique, backlink | Accepté |
